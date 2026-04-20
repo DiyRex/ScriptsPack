@@ -67,6 +67,12 @@ systemctl daemon-reload
 systemctl enable node_exporter
 systemctl restart node_exporter
 
+# Configure UFW firewall
+if command -v ufw >/dev/null 2>&1; then
+    ufw allow 9100/tcp comment 'Prometheus Node Exporter'
+    echo "✓ UFW rule added for port 9100/tcp"
+fi
+
 # Verify
 sleep 2
 if systemctl is-active --quiet node_exporter; then
