@@ -118,8 +118,8 @@ detect_netbird_hostname() {
   fqdn=$(hostname -f 2>/dev/null || hostname)
   if [ -n "$fqdn" ]; then
     local resolved
-    resolved=$(getent hosts "$fqdn" 2>/dev/null | awk '{print $1}' | head -1)
-    if [ "$resolved" = "$NETBIRD_IP" ]; then
+    resolved=$(getent hosts "$fqdn" 2>/dev/null | awk '{print $1}' | head -1 || true)
+    if [ -n "$resolved" ] && [ "$resolved" = "$NETBIRD_IP" ]; then
       NETBIRD_HOSTNAME="$fqdn"
       return 0
     fi
@@ -450,11 +450,15 @@ main() {
   ok "Kubeflow ingress: ${KFLOW_IP}"
 
   # Sanity: hostname resolves to the NetBird IP?
+  # NOTE: NetBird often resolves names via its own daemon, not nsswitch — so
+  # `getent` may legitimately return nothing. Tolerate failures via `|| true`.
   local resolved
-  resolved=$(getent hosts "$NETBIRD_HOSTNAME" 2>/dev/null | awk '{print $1}' | head -1)
+  resolved=$(getent hosts "$NETBIRD_HOSTNAME" 2>/dev/null | awk '{print $1}' | head -1 || true)
   if [ -n "$resolved" ] && [ "$resolved" != "$NETBIRD_IP" ]; then
     warn "Hostname '${NETBIRD_HOSTNAME}' resolves to ${resolved}, not ${NETBIRD_IP}."
     warn "Browser access may fail unless DNS is fixed or you use the IP directly."
+  elif [ -z "$resolved" ]; then
+    log "Hostname '${NETBIRD_HOSTNAME}' not resolvable via getent — assuming NetBird DNS handles it on peers."
   fi
 
   print_detected
