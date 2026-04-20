@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
 #
-# expose-kubeflow-netbird.sh
+# expose-kubeflow-netbird.sh  (v3 — charm-version-aware)
 # -----------------------------------------------------------------------------
 # Configures Charmed Kubeflow's dashboard to be reachable over a NetBird VPN
 # overlay network from any peer.
 #
 # What it does:
 #   1. Auto-detects the NetBird interface (default: wt0) and its IP.
-#   2. Auto-detects the MetalLB-assigned ingress IP for istio-ingressgateway.
-#   3. Sets dex-auth + oidc-gatekeeper public-url to your NetBird hostname.
-#   4. Sets dashboard credentials (default: admin/admin).
+#   2. Auto-detects the MetalLB-assigned ingress IP.
+#   3. Probes which config keys dex-auth / oidc-gatekeeper actually accept
+#      (the key names changed in CKF 1.9+: public-url -> issuer-url on
+#      dex-auth, and public-url became optional on oidc-gatekeeper).
+#   4. Sets dashboard credentials + (if applicable) public/issuer URLs.
 #   5. Adds iptables DNAT + MASQUERADE rules to bridge NetBird traffic into
 #      the cluster's MetalLB IP.
 #   6. Persists IP forwarding sysctl and iptables rules across reboot.
 #   7. Verifies the dashboard is reachable.
 #
-# Idempotent: safe to re-run. Detects and skips already-applied rules.
+# Idempotent. Safe to re-run.
 #
 # Usage:
 #   chmod +x expose-kubeflow-netbird.sh
@@ -30,15 +32,20 @@ set -euo pipefail
 
 # ---- Defaults ---------------------------------------------------------------
 NETBIRD_IFACE="${NETBIRD_IFACE:-wt0}"
-NETBIRD_IP=""                      # auto-detected unless overridden
-NETBIRD_HOSTNAME=""                # auto-detected from `hostname -f` unless overridden
-KFLOW_IP=""                        # auto-detected from istio-ingressgateway-workload svc
+NETBIRD_IP=""
+NETBIRD_HOSTNAME=""
+KFLOW_IP=""
 KUBEFLOW_MODEL="${KUBEFLOW_MODEL:-kubeflow}"
 DEX_USERNAME="${DEX_USERNAME:-admin}"
 DEX_PASSWORD="${DEX_PASSWORD:-admin}"
 EXPOSE_PORT="${EXPOSE_PORT:-80}"
-USE_HTTPS="${USE_HTTPS:-no}"       # set yes if you've put TLS in front
+USE_HTTPS="${USE_HTTPS:-no}"
 SYSCTL_FILE="/etc/sysctl.d/99-netbird-kubeflow.conf"
+
+# Detected capabilities (filled in during probe)
+DEX_HAS_ISSUER_URL="no"
+DEX_HAS_PUBLIC_URL="no"
+OIDC_HAS_PUBLIC_URL="no"
 
 # ---- Pretty output ----------------------------------------------------------
 C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YLW=$'\033[0;33m'
@@ -71,20 +78,35 @@ mk() {
   fi
 }
 
+# Build the user-facing URL (no /dex suffix — for dashboards/browsers).
+user_url() {
+  local scheme="http"
+  [ "$USE_HTTPS" = "yes" ] && scheme="https"
+  local url="${scheme}://${NETBIRD_HOSTNAME}"
+  if { [ "$EXPOSE_PORT" != "80" ] && [ "$scheme" = "http" ]; } || \
+     { [ "$EXPOSE_PORT" != "443" ] && [ "$scheme" = "https" ]; }; then
+    url="${url}:${EXPOSE_PORT}"
+  fi
+  printf '%s' "$url"
+}
+
+# Build the Dex issuer URL (with /dex suffix — per dex-auth charm docs).
+issuer_url() {
+  printf '%s/dex' "$(user_url)"
+}
+
 # ---- Detection --------------------------------------------------------------
 detect_netbird_iface() {
-  # Try common NetBird interface names in order of likelihood.
   for ifname in wt0 nb0 netbird0 utun_nb0; do
     if ip -4 addr show "$ifname" >/dev/null 2>&1; then
       NETBIRD_IFACE="$ifname"
       return 0
     fi
   done
-
-  # Fall back: any interface with a 100.64.0.0/10 IP (CGNAT range NetBird uses).
   local found
   found=$(ip -4 -o addr show 2>/dev/null \
-    | awk '$4 ~ /^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./ {print $2; exit}')
+    | awk '$4 ~ /^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./ {print $2; exit}' \
+    || true)
   if [ -n "$found" ]; then
     NETBIRD_IFACE="$found"
     return 0
@@ -97,13 +119,9 @@ detect_netbird_ip() {
     NETBIRD_IP="$NETBIRD_IP_OVERRIDE"
     return 0
   fi
-
-  if ! detect_netbird_iface; then
-    return 1
-  fi
-
+  detect_netbird_iface || return 1
   NETBIRD_IP=$(ip -4 addr show "$NETBIRD_IFACE" 2>/dev/null \
-                | awk '/inet / {print $2; exit}' | cut -d/ -f1)
+                | awk '/inet / {print $2; exit}' | cut -d/ -f1 || true)
   [ -n "$NETBIRD_IP" ]
 }
 
@@ -113,9 +131,8 @@ detect_netbird_hostname() {
     return 0
   fi
 
-  # Prefer the FQDN if it resolves to the NetBird IP.
   local fqdn
-  fqdn=$(hostname -f 2>/dev/null || hostname)
+  fqdn=$(hostname -f 2>/dev/null || hostname || true)
   if [ -n "$fqdn" ]; then
     local resolved
     resolved=$(getent hosts "$fqdn" 2>/dev/null | awk '{print $1}' | head -1 || true)
@@ -125,19 +142,17 @@ detect_netbird_hostname() {
     fi
   fi
 
-  # Try `netbird status` if the CLI is installed.
   if command -v netbird >/dev/null 2>&1; then
     local nb_fqdn
     nb_fqdn=$(sudo netbird status 2>/dev/null \
               | awk -F': *' '/Domain|FQDN|Hostname/ {print $2; exit}' \
-              | tr -d '[:space:]')
+              | tr -d '[:space:]' || true)
     if [ -n "$nb_fqdn" ]; then
       NETBIRD_HOSTNAME="$nb_fqdn"
       return 0
     fi
   fi
 
-  # Last resort: just use the IP itself.
   NETBIRD_HOSTNAME="$NETBIRD_IP"
 }
 
@@ -151,6 +166,29 @@ detect_kubeflow_ingress_ip() {
   return 1
 }
 
+# Returns 0 if the given app/key is a known config option for the deployed charm.
+app_has_config_key() {
+  local app="$1" key="$2"
+  command juju config "$app" --format json 2>/dev/null \
+    | grep -q "\"$key\""
+}
+
+probe_charm_config_keys() {
+  step "Probing charm config schemas"
+  if app_has_config_key dex-auth issuer-url; then
+    DEX_HAS_ISSUER_URL="yes"; ok "dex-auth supports 'issuer-url'"
+  fi
+  if app_has_config_key dex-auth public-url; then
+    DEX_HAS_PUBLIC_URL="yes"; ok "dex-auth supports 'public-url'"
+  fi
+  if app_has_config_key oidc-gatekeeper public-url; then
+    OIDC_HAS_PUBLIC_URL="yes"; ok "oidc-gatekeeper supports 'public-url'"
+  fi
+  if [ "$DEX_HAS_ISSUER_URL" = "no" ] && [ "$DEX_HAS_PUBLIC_URL" = "no" ]; then
+    warn "dex-auth exposes neither 'issuer-url' nor 'public-url'. Continuing with credentials only."
+  fi
+}
+
 print_detected() {
   step "Detected configuration"
   echo "  NetBird interface : ${NETBIRD_IFACE}"
@@ -158,44 +196,61 @@ print_detected() {
   echo "  NetBird hostname  : ${NETBIRD_HOSTNAME}"
   echo "  Kubeflow ingress  : ${KFLOW_IP}"
   echo "  Expose port       : ${EXPOSE_PORT}"
-  echo "  Dashboard URL     : http${USE_HTTPS:+s}://${NETBIRD_HOSTNAME}"
+  echo "  Dashboard URL     : $(user_url)"
   echo "  Dashboard user    : ${DEX_USERNAME}"
+  echo "  dex-auth keys     : issuer-url=${DEX_HAS_ISSUER_URL}  public-url=${DEX_HAS_PUBLIC_URL}"
+  echo "  oidc keys         : public-url=${OIDC_HAS_PUBLIC_URL}"
 }
 
 # ---- Juju config ------------------------------------------------------------
 configure_kubeflow() {
-  step "Configuring Kubeflow public URL & credentials"
+  step "Configuring Kubeflow credentials & URLs"
 
   juju switch "${KUBEFLOW_MODEL}" >/dev/null 2>&1 || \
     die "Could not switch to juju model '${KUBEFLOW_MODEL}'. Is Kubeflow deployed?"
 
-  local scheme="http"
-  [ "$USE_HTTPS" = "yes" ] && scheme="https"
-  local public_url="${scheme}://${NETBIRD_HOSTNAME}"
-  if { [ "$EXPOSE_PORT" != "80" ] && [ "$scheme" = "http" ]; } || \
-     { [ "$EXPOSE_PORT" != "443" ] && [ "$scheme" = "https" ]; }; then
-    public_url="${public_url}:${EXPOSE_PORT}"
+  local dash_url issuer
+  dash_url="$(user_url)"
+  issuer="$(issuer_url)"
+
+  # Credentials — stable keys across all CKF versions.
+  log "Setting dex-auth static-username=${DEX_USERNAME}"
+  juju config dex-auth static-username="${DEX_USERNAME}"
+  log "Setting dex-auth static-password (hidden)"
+  juju config dex-auth static-password="${DEX_PASSWORD}"
+
+  # Set whichever URL config the current charm revision supports.
+  if [ "$DEX_HAS_ISSUER_URL" = "yes" ]; then
+    log "Setting dex-auth issuer-url = ${issuer}"
+    juju config dex-auth issuer-url="${issuer}" || \
+      warn "dex-auth issuer-url failed (non-fatal — dex falls back to cluster-internal URL)"
+  elif [ "$DEX_HAS_PUBLIC_URL" = "yes" ]; then
+    log "Setting dex-auth public-url = ${dash_url}  (legacy key)"
+    juju config dex-auth public-url="${dash_url}" || \
+      warn "dex-auth public-url failed (non-fatal)"
+  else
+    log "dex-auth has no URL config option — skipping (charm auto-detects on 1.9+)"
   fi
 
-  log "Setting dex-auth public-url      = ${public_url}"
-  juju config dex-auth public-url="${public_url}"
-
-  log "Setting oidc-gatekeeper public-url = ${public_url}"
-  juju config oidc-gatekeeper public-url="${public_url}"
-
-  log "Setting dex-auth credentials (user=${DEX_USERNAME})"
-  juju config dex-auth static-username="${DEX_USERNAME}"
-  juju config dex-auth static-password="${DEX_PASSWORD}"
+  if [ "$OIDC_HAS_PUBLIC_URL" = "yes" ]; then
+    log "Setting oidc-gatekeeper public-url = ${dash_url}"
+    juju config oidc-gatekeeper public-url="${dash_url}" || \
+      warn "oidc-gatekeeper public-url failed (non-fatal — often optional in 1.9+)"
+  fi
 
   ok "Juju config applied"
   log "Auth pods will restart; this can take 1-2 minutes."
 
-  # Brief poll for dex-auth to come back to active.
   local deadline=$((SECONDS + 180))
   while [ $SECONDS -lt $deadline ]; do
-    local s
-    s=$(juju status dex-auth --format json 2>/dev/null \
-        | python3 -c "import sys,json; d=json.load(sys.stdin); u=d['applications']['dex-auth']['units']; print(list(u.values())[0]['workload-status']['current'])" 2>/dev/null || echo "")
+    local s=""
+    s=$(command juju status dex-auth --format json 2>/dev/null \
+        | python3 -c "import sys,json
+try:
+    d=json.load(sys.stdin); u=d['applications']['dex-auth']['units']
+    print(list(u.values())[0]['workload-status']['current'])
+except Exception:
+    print('')" 2>/dev/null || echo "")
     if [ "$s" = "active" ]; then
       ok "dex-auth is active"
       return 0
@@ -207,7 +262,6 @@ configure_kubeflow() {
 
 # ---- iptables NAT bridge ----------------------------------------------------
 rule_exists() {
-  # rule_exists <table> <chain> <rule-spec...>  → 0 if rule exists, 1 if not
   local table="$1" chain="$2"; shift 2
   sudo iptables -t "$table" -C "$chain" "$@" 2>/dev/null
 }
@@ -220,7 +274,6 @@ apply_nat_rules() {
   echo "net.ipv4.ip_forward=1" | sudo tee "$SYSCTL_FILE" >/dev/null
   ok "IP forwarding enabled (persistent in $SYSCTL_FILE)"
 
-  # PREROUTING DNAT: incoming traffic on NetBird IP:port → Kubeflow ingress
   local dnat_args=(-p tcp -d "$NETBIRD_IP" --dport "$EXPOSE_PORT"
                    -j DNAT --to-destination "${KFLOW_IP}:${EXPOSE_PORT}")
   if rule_exists nat PREROUTING "${dnat_args[@]}"; then
@@ -231,7 +284,6 @@ apply_nat_rules() {
     ok "DNAT rule added"
   fi
 
-  # POSTROUTING MASQUERADE: hide return traffic behind the host
   local masq_args=(-p tcp -d "$KFLOW_IP" --dport "$EXPOSE_PORT" -j MASQUERADE)
   if rule_exists nat POSTROUTING "${masq_args[@]}"; then
     ok "MASQUERADE rule already present"
@@ -247,7 +299,6 @@ persist_iptables() {
   if ! dpkg -s iptables-persistent >/dev/null 2>&1; then
     log "Installing iptables-persistent (non-interactive)…"
     DEBIAN_FRONTEND=noninteractive sudo -E apt-get update -qq
-    # Pre-answer the debconf prompts so the install doesn't block.
     echo iptables-persistent iptables-persistent/autosave_v4 boolean true | sudo debconf-set-selections
     echo iptables-persistent iptables-persistent/autosave_v6 boolean true | sudo debconf-set-selections
     DEBIAN_FRONTEND=noninteractive sudo -E apt-get install -y iptables-persistent
@@ -259,11 +310,6 @@ persist_iptables() {
 remove_nat_rules() {
   step "Removing iptables NAT rules"
 
-  if [ -z "$NETBIRD_IP" ] || [ -z "$KFLOW_IP" ]; then
-    warn "Could not auto-detect IPs to scope the removal — removing any rule that matches Kubeflow port ${EXPOSE_PORT}."
-  fi
-
-  # Try every plausible matching rule. -D is idempotent enough; ignore failures.
   if [ -n "$NETBIRD_IP" ] && [ -n "$KFLOW_IP" ]; then
     if sudo iptables -t nat -D PREROUTING -p tcp -d "$NETBIRD_IP" --dport "$EXPOSE_PORT" \
          -j DNAT --to-destination "${KFLOW_IP}:${EXPOSE_PORT}" 2>/dev/null; then
@@ -277,6 +323,8 @@ remove_nat_rules() {
     else
       warn "MASQUERADE rule not present"
     fi
+  else
+    warn "Could not auto-detect IPs; no rules to remove"
   fi
 
   if dpkg -s iptables-persistent >/dev/null 2>&1; then
@@ -284,21 +332,13 @@ remove_nat_rules() {
     ok "Saved updated rules"
   fi
   sudo rm -f "$SYSCTL_FILE"
-  ok "Removed $SYSCTL_FILE (you may want to reboot or 'sudo sysctl -w net.ipv4.ip_forward=0')"
+  ok "Removed $SYSCTL_FILE"
 }
 
 # ---- Verification -----------------------------------------------------------
 verify() {
   step "Verifying dashboard reachability"
-
-  local scheme="http"
-  [ "$USE_HTTPS" = "yes" ] && scheme="https"
-  local url="${scheme}://${NETBIRD_HOSTNAME}"
-  if { [ "$EXPOSE_PORT" != "80" ] && [ "$scheme" = "http" ]; } || \
-     { [ "$EXPOSE_PORT" != "443" ] && [ "$scheme" = "https" ]; }; then
-    url="${url}:${EXPOSE_PORT}"
-  fi
-
+  local url; url="$(user_url)"
   log "Trying: curl -I ${url}"
   local http_code
   http_code=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 15 "$url" || echo "000")
@@ -318,15 +358,8 @@ verify() {
   esac
 }
 
-# ---- Persistence: access info -----------------------------------------------
 save_access_info() {
-  local scheme="http"
-  [ "$USE_HTTPS" = "yes" ] && scheme="https"
-  local url="${scheme}://${NETBIRD_HOSTNAME}"
-  if { [ "$EXPOSE_PORT" != "80" ] && [ "$scheme" = "http" ]; } || \
-     { [ "$EXPOSE_PORT" != "443" ] && [ "$scheme" = "https" ]; }; then
-    url="${url}:${EXPOSE_PORT}"
-  fi
+  local url; url="$(user_url)"
   {
     echo "KUBEFLOW_URL=${url}"
     echo "KUBEFLOW_USER=${DEX_USERNAME}"
@@ -339,12 +372,12 @@ save_access_info() {
   ok "Saved access info to ~/.kubeflow-access"
 }
 
-# ---- Status -----------------------------------------------------------------
 show_status() {
   step "Current state"
   detect_netbird_ip || warn "NetBird interface/IP not detected"
   detect_netbird_hostname
   detect_kubeflow_ingress_ip || warn "Kubeflow ingress IP not detected"
+  probe_charm_config_keys || true
   print_detected
 
   echo
@@ -356,11 +389,6 @@ show_status() {
   echo "${C_BLD}IP forwarding:${C_OFF}"
   echo "  net.ipv4.ip_forward = $(cat /proc/sys/net/ipv4/ip_forward)"
 
-  echo
-  echo "${C_BLD}Juju public-url config:${C_OFF}"
-  juju config dex-auth public-url 2>/dev/null || warn "juju not configured"
-  juju config oidc-gatekeeper public-url 2>/dev/null || true
-
   if [ -r "$HOME/.kubeflow-access" ]; then
     echo
     echo "${C_BLD}Saved access info (~/.kubeflow-access):${C_OFF}"
@@ -368,15 +396,8 @@ show_status() {
   fi
 }
 
-# ---- Summary ----------------------------------------------------------------
 print_summary() {
-  local scheme="http"
-  [ "$USE_HTTPS" = "yes" ] && scheme="https"
-  local url="${scheme}://${NETBIRD_HOSTNAME}"
-  if { [ "$EXPOSE_PORT" != "80" ] && [ "$scheme" = "http" ]; } || \
-     { [ "$EXPOSE_PORT" != "443" ] && [ "$scheme" = "https" ]; }; then
-    url="${url}:${EXPOSE_PORT}"
-  fi
+  local url; url="$(user_url)"
   cat <<EOF
 
 ${C_BLD}==============================================================${C_OFF}
@@ -392,7 +413,7 @@ On first login you'll be asked to pick a namespace name (e.g. 'admin').
 
 Files written:
   ~/.kubeflow-access            (URL + credentials, mode 600)
-  ${SYSCTL_FILE}        (persistent IP forwarding)
+  ${SYSCTL_FILE}   (persistent IP forwarding)
   /etc/iptables/rules.v4        (persistent NAT rules)
 
 To inspect or undo:
@@ -402,10 +423,7 @@ To inspect or undo:
 EOF
 }
 
-# ---- Main -------------------------------------------------------------------
-usage() {
-  sed -n '2,30p' "$0"
-}
+usage() { sed -n '2,30p' "$0"; }
 
 parse_args() {
   while [ $# -gt 0 ]; do
@@ -440,7 +458,7 @@ main() {
   esac
 
   step "Detecting environment"
-  detect_netbird_ip || die "Could not detect a NetBird IP. Pass --iface <name> or --ip <addr>."
+  detect_netbird_ip || die "Could not detect a NetBird IP. Pass --iface <n> or --ip <addr>."
   ok "NetBird IP: ${NETBIRD_IP} on ${NETBIRD_IFACE}"
 
   detect_netbird_hostname
@@ -449,24 +467,22 @@ main() {
   detect_kubeflow_ingress_ip || die "Kubeflow ingress IP not assigned. Is MetalLB running and the bundle deployed?"
   ok "Kubeflow ingress: ${KFLOW_IP}"
 
-  # Sanity: hostname resolves to the NetBird IP?
-  # NOTE: NetBird often resolves names via its own daemon, not nsswitch — so
-  # `getent` may legitimately return nothing. Tolerate failures via `|| true`.
   local resolved
   resolved=$(getent hosts "$NETBIRD_HOSTNAME" 2>/dev/null | awk '{print $1}' | head -1 || true)
   if [ -n "$resolved" ] && [ "$resolved" != "$NETBIRD_IP" ]; then
     warn "Hostname '${NETBIRD_HOSTNAME}' resolves to ${resolved}, not ${NETBIRD_IP}."
-    warn "Browser access may fail unless DNS is fixed or you use the IP directly."
+    warn "Browser access may fail unless DNS is fixed."
   elif [ -z "$resolved" ]; then
-    log "Hostname '${NETBIRD_HOSTNAME}' not resolvable via getent — assuming NetBird DNS handles it on peers."
+    log "Hostname '${NETBIRD_HOSTNAME}' not in local resolver — assuming NetBird DNS handles it on peers."
   fi
 
+  probe_charm_config_keys
   print_detected
   configure_kubeflow
   apply_nat_rules
   persist_iptables
   save_access_info
-  verify || warn "Verification failed. Try the curl command above in ~60s; auth pods may still be restarting."
+  verify || warn "Verification failed. Try the curl command again in ~60s; auth pods may still be restarting."
   print_summary
 }
 
